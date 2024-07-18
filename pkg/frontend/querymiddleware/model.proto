@@ -43,6 +43,12 @@ message SampleStream {
   repeated cortexpb.FloatHistogramPair histograms = 3 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "histograms"];
 }
 
+message CachedError {
+  string key = 1 [(gogoproto.jsontag) = "key"];
+  string type = 2 [(gogoproto.jsontag) = "errorType"];
+  string message = 3 [(gogoproto.jsontag) = "error"];
+}
+
 message CachedResponse  {
   string key = 1 [(gogoproto.jsontag) = "key"];
 

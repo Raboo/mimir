@@ -1649,6 +1649,9 @@ results_cache:
 # CLI flag: -query-frontend.cache-results
 [cache_results: <boolean> | default = false]
 
+# (experimental)
+[cache_errors: <boolean> | default = ]
+
 # (advanced) Maximum number of retries for a single request; beyond this, the
 # downstream error is returned.
 # CLI flag: -query-frontend.max-retries-per-request

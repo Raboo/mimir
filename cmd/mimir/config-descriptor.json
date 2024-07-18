@@ -6293,6 +6293,16 @@
         },
         {
           "kind": "field",
+          "name": "cache_errors",
+          "required": false,
+          "desc": "",
+          "fieldValue": null,
+          "fieldDefaultValue": false,
+          "fieldType": "boolean",
+          "fieldCategory": "experimental"
+        },
+        {
+          "kind": "field",
           "name": "max_retries",
           "required": false,
           "desc": "Maximum number of retries for a single request; beyond this, the downstream error is returned.",

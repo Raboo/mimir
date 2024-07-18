@@ -62,6 +62,7 @@ type Config struct {
 	SplitQueriesByInterval   time.Duration `yaml:"split_queries_by_interval" category:"advanced"`
 	ResultsCacheConfig       `yaml:"results_cache"`
 	CacheResults             bool          `yaml:"cache_results"`
+	CacheErrors              bool          `yaml:"cache_errors" category:"experimental"`
 	MaxRetries               int           `yaml:"max_retries" category:"advanced"`
 	NotRunningTimeout        time.Duration `yaml:"not_running_timeout" category:"advanced"`
 	ShardedQueries           bool          `yaml:"parallelize_shardable_queries"`
@@ -106,7 +107,7 @@ func (cfg *Config) Validate() error {
 		}
 	}
 
-	if cfg.CacheResults || cfg.cardinalityBasedShardingEnabled() {
+	if cfg.CacheResults || cfg.CacheErrors || cfg.cardinalityBasedShardingEnabled() {
 		if err := cfg.ResultsCacheConfig.Validate(); err != nil {
 			return errors.Wrap(err, "invalid query-frontend results cache config")
 		}
@@ -338,6 +339,15 @@ func newQueryMiddlewares(
 		newInstrumentMiddleware("step_align", metrics),
 		newStepAlignMiddleware(limits, log, registerer),
 	)
+
+	if cfg.CacheResults && cfg.CacheErrors {
+		// TODO: Use a real TTL
+		queryRangeMiddleware = append(
+			queryRangeMiddleware,
+			newInstrumentMiddleware("error_caching", metrics),
+			newErrorCachingMiddleware(cacheClient, limits, 5*time.Minute, resultsCacheEnabledByOption, log, registerer),
+		)
+	}
 
 	// Inject the middleware to split requests by interval + results cache (if at least one of the two is enabled).
 	if cfg.SplitQueriesByInterval > 0 || cfg.CacheResults {
