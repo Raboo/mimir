@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
+	"github.com/grafana/dskit/flagext"
 	"github.com/grafana/dskit/services"
 	"github.com/oklog/ulid"
 	"github.com/prometheus/client_golang/prometheus"
@@ -34,21 +35,17 @@ const (
 )
 
 func blockBuilderConfig(t *testing.T, addr string) (Config, *validation.Overrides) {
-	cfg := Config{
-		InstanceID:            "block-builder-0",
-		ConsumeInterval:       time.Hour,
-		ConsumeIntervalBuffer: 15 * time.Minute,
-		Kafka: KafkaConfig{
-			Address:       addr,
-			Topic:         testTopic,
-			ClientID:      "1",
-			DialTimeout:   10 * time.Second,
-			PollTimeout:   500 * time.Millisecond,
-			ConsumerGroup: testGroup,
-		},
-		LookbackOnNoCommit: 12 * time.Hour,
-	}
+	cfg := Config{}
+	flagext.DefaultValues(&cfg)
 
+	cfg.InstanceID = "block-builder-0"
+
+	// Kafka related settings.
+	cfg.Kafka.Address = addr
+	cfg.Kafka.Topic = testTopic
+	cfg.Kafka.ConsumerGroup = testGroup
+
+	// Block storage related settings.
 	cfg.BlocksStorageConfig.TSDB.Dir = t.TempDir()
 	cfg.BlocksStorageConfig.Bucket.StorageBackendConfig.Backend = bucket.Filesystem
 	cfg.BlocksStorageConfig.Bucket.Filesystem.Directory = t.TempDir()
@@ -693,7 +690,9 @@ func TestBlockBuilder_LongCatchupWithNoRecordsProcessed(t *testing.T) {
 	cfg.Kafka.PartitionAssignment = map[int][]int32{
 		0: {0}, // instance 0 -> partition 0
 	}
-	cfg.LookbackOnNoCommit = 3 * time.Hour
+	//cfg.LookbackOnNoCommit = 3 * time.Hour
+	// Configure consumer to start from the topic's end, i.e. "latest" offset, when there is no commit.
+	cfg.Kafka.ConsumerResetOffset = kafkaOffset(kgo.NewOffset().AtEnd())
 
 	// Producing some records
 	kafkaTime := time.Now().Truncate(cfg.ConsumeInterval).Add(-7 * time.Hour).Add(29 * time.Minute)
