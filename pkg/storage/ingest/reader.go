@@ -804,6 +804,10 @@ type fetchResult struct {
 	fetchedBytes int
 }
 
+func emptyFetchResult(err error) fetchResult {
+	return fetchResult{kgo.FetchPartition{Err: err}, 0}
+}
+
 type concurrentFetchers struct {
 	client      *kgo.Client
 	logger      log.Logger
@@ -891,45 +895,53 @@ func (r *concurrentFetchers) pollFetches(ctx context.Context) (result kgo.Fetche
 	}
 }
 
+var errUnknownPartitionLeader = fmt.Errorf("unknown partition leader")
+
+// fetchSingle sends a fetch request to the leader Kafka broker for a partition for the fetchWant and parses the responses.
 // fetchSingle returns a fetchResult which may or may not fulfil the entire fetchWant.
+// If ctx is cancelled, fetchSingle will return an empty fetchResult without an error.
 func (r *concurrentFetchers) fetchSingle(ctx context.Context, fw fetchWant, logger log.Logger) (fr fetchResult) {
 	defer func(fetchStartTime time.Time) {
 		logCompletedFetch(logger, fr, fetchStartTime, fw)
 	}(time.Now())
 
+	leaderID, leaderEpoch, err := r.client.PartitionLeader(r.topicName, r.partitionID)
+	if err != nil || (leaderID == -1 && leaderEpoch == -1) {
+		if err != nil {
+			return emptyFetchResult(fmt.Errorf("finding leader for partition: %w", err))
+		}
+		return emptyFetchResult(errUnknownPartitionLeader)
+	}
+
 	req := kmsg.NewFetchRequest()
 	req.MinBytes = 1
 	req.Version = 13
-	req.MaxWaitMillis = 10000
+	req.MaxWaitMillis = 10
 	req.MaxBytes = fw.MaxBytes()
 
 	reqTopic := kmsg.NewFetchRequestTopic()
 	reqTopic.Topic = r.topicName
 	reqTopic.TopicID = r.topicID
 
-	// Using NewFetchRequestTopicPartition gives us a partition with the default values.
-	// One of them is CurrentLeaderEpoch: -1, which means we don't know the leader epoch and Kafka brokers are ok with that.
-	// It does mean that we might end up fetching from an out-of-sync replica.
-	// If we provide this the broker would check if we have up-to-date data.
 	reqPartition := kmsg.NewFetchRequestTopicPartition()
 	reqPartition.Partition = r.partitionID
 	reqPartition.FetchOffset = fw.startOffset
 	reqPartition.PartitionMaxBytes = req.MaxBytes
+	reqPartition.CurrentLeaderEpoch = leaderEpoch
 
 	reqTopic.Partitions = append(reqTopic.Partitions, reqPartition)
 	req.Topics = append(req.Topics, reqTopic)
 
-	resp, err := req.RequestWith(ctx, r.client)
+	resp, err := req.RequestWith(ctx, r.client.Broker(int(leaderID)))
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			return fetchResult{kgo.FetchPartition{}, 0}
+			return emptyFetchResult(nil)
 		}
-		return fetchResult{kgo.FetchPartition{
-			Err: fmt.Errorf("fetching from kafka: %w", err),
-		}, 0}
+		return emptyFetchResult(fmt.Errorf("fetching from kafka: %w", err))
 	}
 	rawPartitionResp := resp.Topics[0].Partitions[0]
 	// Here we ignore resp.ErrorCode. That error code was added for support for KIP-227 and is only set if we're using fetch sessions. We don't use fetch sessions.
+	// We also ignore rawPartitionResp.PreferredReadReplica to keep the code simpler. We don't provide any rack in the FetchRequest, so the broker _probably_ doesn't have a recommended replica for us.
 	// TODO dimitarvdimitrov make this conditional on the kafka backend - for WS we use uncompressed bytes (sumRecordLengths), for kafka we use the size of the response (rawPartitionResp.RecordBatches)
 	r.metrics.fetchesCompressedBytes.Add(float64(len(rawPartitionResp.RecordBatches))) // This doesn't include overhead in the response, but that should be small.
 	partition := processRespPartition(&rawPartitionResp, r.topicName)
@@ -983,9 +995,9 @@ func (r *concurrentFetchers) runFetcher(ctx context.Context, fetchersWg *sync.Wa
 			f := r.fetchSingle(ctx, w, log.With(logger, "attempt", attempt))
 
 			w = adjustedFetchWantFromErr(f, w)
+			maybeTriggerMetadataRefresh(f.Err, r.client)
 			if len(f.Records) == 0 {
 				backoffFromKafkaFetchErr(f, w, errBackoff, newRecordsProducedBackoff)
-				// TODO proper handling of NotLeaderForPartition ReplicaNotAvailable UnknownLeaderEpoch FencedLeaderEpoch; we need to be able to select the right broker to handle those
 				continue
 			}
 			// We reset the backoff if we received any records whatsoever. A received record means _some_ success.
@@ -999,6 +1011,26 @@ func (r *concurrentFetchers) runFetcher(ctx context.Context, fetchersWg *sync.Wa
 			}
 		}
 		close(w.result)
+	}
+}
+
+func maybeTriggerMetadataRefresh(err error, client *kgo.Client) {
+	shouldRefreshMetadata := errors.Is(err, kerr.NotLeaderForPartition) ||
+		errors.Is(err, kerr.ReplicaNotAvailable) ||
+		errors.Is(err, kerr.UnknownLeaderEpoch) ||
+		errors.Is(err, kerr.FencedLeaderEpoch) ||
+		errors.Is(err, kerr.LeaderNotAvailable) || // this isn't listed in the possible errors in franz-go, but Apache Kafka returns it
+		errors.Is(err, errUnknownPartitionLeader)
+
+	if shouldRefreshMetadata {
+		// Typically franz-go will update its own metadata when it detects a change in leaders. But it's hard to verify this.
+		// So we force a metadata refresh here to be sure.
+		// It's ok to call this from multiple fetchers concurrently. franz-go will only be sending one metadata request at a time (whether automatic, periodic, or forced).
+		//
+		// Metadata refresh is asynchronous. So even after forcing the refresh we might have outdated metadata.
+		// Hopefully the backoff that will follow is enough to get the latest metadata.
+		// If not, the fetcher will end up here again on the next attempt.
+		client.ForceMetadataRefresh()
 	}
 }
 
