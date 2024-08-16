@@ -916,7 +916,7 @@ func (r *concurrentFetchers) fetchSingle(ctx context.Context, fw fetchWant, logg
 	req := kmsg.NewFetchRequest()
 	req.MinBytes = 1
 	req.Version = 13
-	req.MaxWaitMillis = 10
+	req.MaxWaitMillis = 10000
 	req.MaxBytes = fw.MaxBytes()
 
 	reqTopic := kmsg.NewFetchRequestTopic()
