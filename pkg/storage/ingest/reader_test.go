@@ -6,7 +6,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1963,6 +1965,61 @@ func TestPartitionReader_Commit(t *testing.T) {
 		_, err = consumer.waitRecords(0, time.Second, 0)
 		assert.NoError(t, err)
 	})
+}
+
+func TestConcurrentFetchers_FetchDuringLeaderElections(t *testing.T) {
+	const (
+		topicName   = "test"
+		partitionID = 1
+	)
+
+	t.Run("fetch during leader reelections", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithCancelCause(context.Background())
+		t.Cleanup(func() { cancel(errors.New("test done")) })
+
+		cluster, clusterAddr := testkafka.CreateClusterWithBrokers(t, 2, partitionID+1, topicName)
+		// Move ownership to the first node; otherwise it might be random
+		require.NoError(t, cluster.MoveTopicPartition(topicName, partitionID, 0))
+
+		consumer := newTestConsumer(4)
+
+		reader := createAndStartReader(ctx, t, clusterAddr, topicName, partitionID, consumer)
+
+		produceRecord(ctx, t, newKafkaProduceClient(t, clusterAddr), topicName, partitionID, []byte("1"))
+		produceRecord(ctx, t, newKafkaProduceClient(t, clusterAddr), topicName, partitionID, []byte("2"))
+		produceRecord(ctx, t, newKafkaProduceClient(t, clusterAddr), topicName, partitionID, []byte("3"))
+
+		_, err := consumer.waitRecords(3, time.Second, 0)
+		require.NoError(t, err)
+
+		// Move ownership to the second node
+		require.NoError(t, cluster.MoveTopicPartition(topicName, partitionID, 1))
+
+		produceRecord(ctx, t, newKafkaProduceClient(t, clusterAddr), topicName, partitionID, []byte("4"))
+
+		// We get the last record too.
+		_, err = consumer.waitRecords(1, fetchMinBytesWaitTime+time.Second, 0)
+		require.NoError(t, err)
+
+		require.NoError(t, services.StopAndAwaitTerminated(ctx, reader))
+	})
+
+	t.Run("control returns fenced leader the other 4 errors we care about", func(t *testing.T) {
+		// TODO dimitarvdimitrov
+	})
+}
+
+func portFromAddress(addr string) int {
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		panic(err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		panic(err)
+	}
+	return port
 }
 
 type testConsumer struct {

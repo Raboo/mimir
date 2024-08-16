@@ -30,6 +30,19 @@ func CreateClusterWithoutCustomConsumerGroupsSupport(t testing.TB, numPartitions
 	return cluster, addrs[0]
 }
 
+func CreateClusterWithBrokers(t testing.TB, numBrokers int, numPartitions int32, topicName string) (*kfake.Cluster, string) {
+	cluster, err := kfake.NewCluster(kfake.NumBrokers(numBrokers), kfake.SeedTopics(numPartitions, topicName))
+	require.NoError(t, err)
+	t.Cleanup(cluster.Close)
+
+	addrs := cluster.ListenAddrs()
+	require.Len(t, addrs, 2)
+
+	addSupportForConsumerGroups(t, cluster, topicName, numPartitions)
+
+	return cluster, addrs[0]
+}
+
 // addSupportForConsumerGroups adds very bare-bones support for one consumer group.
 // It expects that only one partition is consumed at a time.
 func addSupportForConsumerGroups(t testing.TB, cluster *kfake.Cluster, topicName string, numPartitions int32) {

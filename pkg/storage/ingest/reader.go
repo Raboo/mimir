@@ -897,6 +897,10 @@ func (r *concurrentFetchers) pollFetches(ctx context.Context) (result kgo.Fetche
 
 var errUnknownPartitionLeader = fmt.Errorf("unknown partition leader")
 
+// fetchMinBytesWaitTime is the time the Kafka broker can wait for MinBytes to be filled.
+// This is usually used when there aren't enough records available to fulfil MinBytes, so the broker waits for more records to be produced.
+const fetchMinBytesWaitTime = 10 * time.Second
+
 // fetchSingle sends a fetch request to the leader Kafka broker for a partition for the fetchWant and parses the responses.
 // fetchSingle returns a fetchResult which may or may not fulfil the entire fetchWant.
 // If ctx is cancelled, fetchSingle will return an empty fetchResult without an error.
@@ -916,7 +920,7 @@ func (r *concurrentFetchers) fetchSingle(ctx context.Context, fw fetchWant, logg
 	req := kmsg.NewFetchRequest()
 	req.MinBytes = 1
 	req.Version = 13
-	req.MaxWaitMillis = 10000
+	req.MaxWaitMillis = int32(fetchMinBytesWaitTime / time.Millisecond)
 	req.MaxBytes = fw.MaxBytes()
 
 	reqTopic := kmsg.NewFetchRequestTopic()
