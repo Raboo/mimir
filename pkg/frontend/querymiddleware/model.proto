@@ -45,8 +45,8 @@ message SampleStream {
 
 message CachedError {
   string key = 1 [(gogoproto.jsontag) = "key"];
-  string type = 2 [(gogoproto.jsontag) = "errorType"];
-  string message = 3 [(gogoproto.jsontag) = "error"];
+  string errorType = 2 [(gogoproto.jsontag) = "errorType"];
+  string errorMessage = 3 [(gogoproto.jsontag) = "errorMessage"];
 }
 
 message CachedResponse  {

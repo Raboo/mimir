@@ -144,7 +144,7 @@ func (e *errorCachingHandler) loadErrorFromCache(ctx context.Context, key, hashe
 			return nil
 		}
 
-		return apierror.New(apierror.Type(cachedError.Type), cachedError.Message)
+		return apierror.New(apierror.Type(cachedError.ErrorType), cachedError.ErrorMessage)
 	}
 
 	return nil
@@ -152,9 +152,9 @@ func (e *errorCachingHandler) loadErrorFromCache(ctx context.Context, key, hashe
 
 func (e *errorCachingHandler) storeErrorToCache(key, hashedKey string, apiErr *apierror.APIError) {
 	bytes, err := proto.Marshal(&CachedError{
-		Key:     key,
-		Type:    string(apiErr.Type),
-		Message: apiErr.Message,
+		Key:          key,
+		ErrorType:    string(apiErr.Type),
+		ErrorMessage: apiErr.Message,
 	})
 
 	if err != nil {
@@ -170,7 +170,7 @@ func (e *errorCachingHandler) cacheKey(tenantID string, r MetricsQueryRequest) s
 }
 
 func (e *errorCachingHandler) isCacheable(apiErr *apierror.APIError, req MetricsQueryRequest, tenantIDs []string) (bool, string) {
-	if apiErr.Type != apierror.TypeBadData && apiErr.Type != apierror.TypeExec {
+	if apiErr.Type != apierror.TypeBadData && apiErr.Type != apierror.TypeExec && apiErr.Type != apierror.TypeTooLargeEntry {
 		return false, reasonNotCacheableError
 	}
 
