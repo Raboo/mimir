@@ -713,6 +713,7 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *parser.Eval
 			lookbackDelta:            s.LookbackDelta,
 			samplesStats:             query.sampleStats,
 			noStepSubqueryIntervalFn: ng.noStepSubqueryIntervalFn,
+			querier:                  querier,
 		}
 		query.sampleStats.InitStepTracking(start, start, 1)
 
@@ -771,6 +772,7 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *parser.Eval
 		lookbackDelta:            s.LookbackDelta,
 		samplesStats:             query.sampleStats,
 		noStepSubqueryIntervalFn: ng.noStepSubqueryIntervalFn,
+		querier:                  querier,
 	}
 	query.sampleStats.InitStepTracking(evaluator.startTimestamp, evaluator.endTimestamp, evaluator.interval)
 	val, warnings, err := evaluator.Eval(s.Expr)
@@ -939,6 +941,7 @@ func (ng *Engine) populateSeries(ctx context.Context, querier storage.Querier, s
 			evalRange = 0
 			hints.By, hints.Grouping = extractGroupsFromPath(path)
 			n.UnexpandedSeriesSet = querier.Select(ctx, false, hints, n.LabelMatchers...)
+			n.SelectHints = hints
 
 		case *parser.MatrixSelector:
 			evalRange = n.Range
@@ -977,10 +980,10 @@ func extractGroupsFromPath(p []parser.Node) (bool, []string) {
 	return false, nil
 }
 
-func checkAndExpandSeriesSet(ctx context.Context, expr parser.Expr) (annotations.Annotations, error) {
+func (ev *evaluator) checkAndExpandSeriesSet(ctx context.Context, expr parser.Expr) (annotations.Annotations, error) {
 	switch e := expr.(type) {
 	case *parser.MatrixSelector:
-		return checkAndExpandSeriesSet(ctx, e.VectorSelector)
+		return ev.checkAndExpandSeriesSet(ctx, e.VectorSelector)
 	case *parser.VectorSelector:
 		if e.Series != nil {
 			return nil, nil
@@ -992,6 +995,7 @@ func checkAndExpandSeriesSet(ctx context.Context, expr parser.Expr) (annotations
 			}
 		}
 		e.Series = series
+		ev.selectHints = e.SelectHints
 		return ws, err
 	}
 	return nil, nil
@@ -1033,6 +1037,11 @@ type evaluator struct {
 	lookbackDelta            time.Duration
 	samplesStats             *stats.QuerySamples
 	noStepSubqueryIntervalFn func(rangeMillis int64) int64
+
+	querier storage.Querier
+
+	// selectHints is the top-most SelectHints in the expression tree.
+	selectHints *storage.SelectHints
 }
 
 // errorf causes a panic with the input formatted into an error.
@@ -1102,6 +1111,10 @@ type EvalNodeHelper struct {
 	rightSigs    map[string]Sample
 	matchedSigs  map[string]map[uint64]struct{}
 	resultMetric map[string]labels.Labels
+
+	// For base and info vector matching.
+	infoSamplesBySig map[string]Sample
+	labelBuilder     *labels.ScratchBuilder
 }
 
 func (enh *EvalNodeHelper) resetBuilder(lbls labels.Labels) {
@@ -1420,6 +1433,69 @@ func (ev *evaluator) rangeEvalAgg(aggExpr *parser.AggregateExpr, sortedGrouping 
 	return result, warnings
 }
 
+// expandSeriesToMatrix expands a set of storage.Series to a Matrix.
+func (ev *evaluator) expandSeriesToMatrix(series []storage.Series, offset time.Duration, start, end, interval int64, recordOrigT bool) Matrix {
+	numSteps := int((end-start)/interval) + 1
+
+	mat := make(Matrix, 0, len(series))
+	var prevSS *Series
+	it := storage.NewMemoizedEmptyIterator(durationMilliseconds(ev.lookbackDelta))
+	var chkIter chunkenc.Iterator
+	for _, s := range series {
+		if err := contextDone(ev.ctx, "expression evaluation"); err != nil {
+			ev.error(err)
+		}
+
+		chkIter = s.Iterator(chkIter)
+		it.Reset(chkIter)
+		ss := Series{
+			Metric: s.Labels(),
+		}
+
+		for ts, step := start, -1; ts <= end; ts += interval {
+			step++
+			origT, f, h, ok := ev.vectorSelectorSingle(it, offset, ts)
+			if !ok {
+				continue
+			}
+			if !recordOrigT {
+				origT = 0
+			}
+
+			if h == nil {
+				ev.currentSamples++
+				ev.samplesStats.IncrementSamplesAtStep(step, 1)
+				if ev.currentSamples > ev.maxSamples {
+					ev.error(ErrTooManySamples(env))
+				}
+				if ss.Floats == nil {
+					ss.Floats = reuseOrGetFPointSlices(prevSS, numSteps)
+				}
+				ss.Floats = append(ss.Floats, FPoint{F: f, T: ts, OrigT: origT})
+			} else {
+				point := HPoint{H: h, T: ts, OrigT: origT}
+				histSize := point.size()
+				ev.currentSamples += histSize
+				ev.samplesStats.IncrementSamplesAtStep(step, int64(histSize))
+				if ev.currentSamples > ev.maxSamples {
+					ev.error(ErrTooManySamples(env))
+				}
+				if ss.Histograms == nil {
+					ss.Histograms = reuseOrGetHPointSlices(prevSS, numSteps)
+				}
+				ss.Histograms = append(ss.Histograms, point)
+			}
+		}
+
+		if len(ss.Floats)+len(ss.Histograms) > 0 {
+			mat = append(mat, ss)
+			prevSS = &mat[len(mat)-1]
+		}
+	}
+	ev.samplesStats.UpdatePeak(ev.currentSamples)
+	return mat
+}
+
 // evalSubquery evaluates given SubqueryExpr and returns an equivalent
 // evaluated MatrixSelector in its place. Note that the Name and LabelMatchers are not set.
 func (ev *evaluator) evalSubquery(subq *parser.SubqueryExpr) (*parser.MatrixSelector, int, annotations.Annotations) {
@@ -1564,6 +1640,8 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, annotations.Annotatio
 			return ev.evalLabelReplace(e.Args)
 		case "label_join":
 			return ev.evalLabelJoin(e.Args)
+		case "info":
+			return ev.evalInfo(ev.ctx, e.Args)
 		}
 
 		if !matrixArg {
@@ -1594,7 +1672,7 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, annotations.Annotatio
 		sel := arg.(*parser.MatrixSelector)
 		selVS := sel.VectorSelector.(*parser.VectorSelector)
 
-		ws, err := checkAndExpandSeriesSet(ev.ctx, sel)
+		ws, err := ev.checkAndExpandSeriesSet(ev.ctx, sel)
 		warnings.Merge(ws)
 		if err != nil {
 			ev.error(errWithWarnings{fmt.Errorf("expanding series: %w", err), warnings})
@@ -1840,60 +1918,11 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, annotations.Annotatio
 		return String{V: e.Val, T: ev.startTimestamp}, nil
 
 	case *parser.VectorSelector:
-		ws, err := checkAndExpandSeriesSet(ev.ctx, e)
+		ws, err := ev.checkAndExpandSeriesSet(ev.ctx, e)
 		if err != nil {
 			ev.error(errWithWarnings{fmt.Errorf("expanding series: %w", err), ws})
 		}
-		mat := make(Matrix, 0, len(e.Series))
-		var prevSS *Series
-		it := storage.NewMemoizedEmptyIterator(durationMilliseconds(ev.lookbackDelta))
-		var chkIter chunkenc.Iterator
-		for i, s := range e.Series {
-			if err := contextDone(ev.ctx, "expression evaluation"); err != nil {
-				ev.error(err)
-			}
-			chkIter = s.Iterator(chkIter)
-			it.Reset(chkIter)
-			ss := Series{
-				Metric: e.Series[i].Labels(),
-			}
-
-			for ts, step := ev.startTimestamp, -1; ts <= ev.endTimestamp; ts += ev.interval {
-				step++
-				_, f, h, ok := ev.vectorSelectorSingle(it, e, ts)
-				if ok {
-					if h == nil {
-						ev.currentSamples++
-						ev.samplesStats.IncrementSamplesAtStep(step, 1)
-						if ev.currentSamples > ev.maxSamples {
-							ev.error(ErrTooManySamples(env))
-						}
-						if ss.Floats == nil {
-							ss.Floats = reuseOrGetFPointSlices(prevSS, numSteps)
-						}
-						ss.Floats = append(ss.Floats, FPoint{F: f, T: ts})
-					} else {
-						point := HPoint{H: h, T: ts}
-						histSize := point.size()
-						ev.currentSamples += histSize
-						ev.samplesStats.IncrementSamplesAtStep(step, int64(histSize))
-						if ev.currentSamples > ev.maxSamples {
-							ev.error(ErrTooManySamples(env))
-						}
-						if ss.Histograms == nil {
-							ss.Histograms = reuseOrGetHPointSlices(prevSS, numSteps)
-						}
-						ss.Histograms = append(ss.Histograms, point)
-					}
-				}
-			}
-
-			if len(ss.Floats)+len(ss.Histograms) > 0 {
-				mat = append(mat, ss)
-				prevSS = &mat[len(mat)-1]
-			}
-		}
-		ev.samplesStats.UpdatePeak(ev.currentSamples)
+		mat := ev.expandSeriesToMatrix(e.Series, e.Offset, ev.startTimestamp, ev.endTimestamp, ev.interval, false)
 		return mat, ws
 
 	case *parser.MatrixSelector:
@@ -2036,7 +2065,7 @@ func reuseOrGetFPointSlices(prevSS *Series, numSteps int) (r []FPoint) {
 }
 
 func (ev *evaluator) rangeEvalTimestampFunctionOverVectorSelector(vs *parser.VectorSelector, call FunctionCall, e *parser.Call) (parser.Value, annotations.Annotations) {
-	ws, err := checkAndExpandSeriesSet(ev.ctx, vs)
+	ws, err := ev.checkAndExpandSeriesSet(ev.ctx, vs)
 	if err != nil {
 		ev.error(errWithWarnings{fmt.Errorf("expanding series: %w", err), ws})
 	}
@@ -2058,7 +2087,7 @@ func (ev *evaluator) rangeEvalTimestampFunctionOverVectorSelector(vs *parser.Vec
 		vec := make(Vector, 0, len(vs.Series))
 		for i, s := range vs.Series {
 			it := seriesIterators[i]
-			t, _, _, ok := ev.vectorSelectorSingle(it, vs, enh.Ts)
+			t, _, _, ok := ev.vectorSelectorSingle(it, vs.Offset, enh.Ts)
 			if !ok {
 				continue
 			}
@@ -2082,10 +2111,10 @@ func (ev *evaluator) rangeEvalTimestampFunctionOverVectorSelector(vs *parser.Vec
 }
 
 // vectorSelectorSingle evaluates an instant vector for the iterator of one time series.
-func (ev *evaluator) vectorSelectorSingle(it *storage.MemoizedSeriesIterator, node *parser.VectorSelector, ts int64) (
+func (ev *evaluator) vectorSelectorSingle(it *storage.MemoizedSeriesIterator, offset time.Duration, ts int64) (
 	int64, float64, *histogram.FloatHistogram, bool,
 ) {
-	refTime := ts - durationMilliseconds(node.Offset)
+	refTime := ts - durationMilliseconds(offset)
 	var t int64
 	var v float64
 	var h *histogram.FloatHistogram
@@ -2194,7 +2223,7 @@ func (ev *evaluator) matrixSelector(node *parser.MatrixSelector) (Matrix, annota
 
 		it = storage.NewBuffer(durationMilliseconds(node.Range))
 	)
-	ws, err := checkAndExpandSeriesSet(ev.ctx, node)
+	ws, err := ev.checkAndExpandSeriesSet(ev.ctx, node)
 	if err != nil {
 		ev.error(errWithWarnings{fmt.Errorf("expanding series: %w", err), ws})
 	}
