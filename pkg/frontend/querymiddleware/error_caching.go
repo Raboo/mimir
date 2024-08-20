@@ -13,46 +13,47 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/grafana/dskit/cache"
 	"github.com/grafana/dskit/tenant"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/prometheus/common/model"
-
 	apierror "github.com/grafana/mimir/pkg/api/error"
 	"github.com/grafana/mimir/pkg/util/spanlogger"
-	"github.com/grafana/mimir/pkg/util/validation"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 const (
-	reasonDisabledByOption  = "disable-by-option"
 	reasonNotAPIError       = "not-api-error"
 	reasonNotCacheableError = "not-cacheable-api-error"
 )
 
 func newErrorCachingMiddleware(cache cache.Cache, limits Limits, ttl time.Duration, shouldCacheReq shouldCacheFn, logger log.Logger, reg prometheus.Registerer) MetricsQueryMiddleware {
-	cacheAttempted := promauto.With(reg).NewCounter(prometheus.CounterOpts{
+	cacheLoadAttempted := promauto.With(reg).NewCounter(prometheus.CounterOpts{
 		Name: "cortex_frontend_query_error_cache_requests_total",
-		Help: "",
+		Help: "Number of requests that check the results cache for an error.",
 	})
-	cacheHits := promauto.With(reg).NewCounter(prometheus.CounterOpts{
+	cacheLoadHits := promauto.With(reg).NewCounter(prometheus.CounterOpts{
 		Name: "cortex_frontend_query_error_cache_hits_total",
-		Help: "",
+		Help: "Number of hits for the errors in the results cache.",
+	})
+	cacheStoreAttempted := promauto.With(reg).NewCounter(prometheus.CounterOpts{
+		Name: "cortex_frontend_query_error_cache_store_requests_total",
+		Help: "Number of requests that resulted in an error.",
 	})
 	cacheStoreSkipped := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
-		Name: "cortex_frontend_query_error_cache_skipped_total",
-		Help: "",
+		Name: "cortex_frontend_query_error_cache_store_skipped_total",
+		Help: "Number of requests that resulted in an error that was not stored in the results cache.",
 	}, []string{"reason"})
 
 	return MetricsQueryMiddlewareFunc(func(next MetricsQueryHandler) MetricsQueryHandler {
 		return &errorCachingHandler{
-			next:              next,
-			cache:             cache,
-			limits:            limits,
-			ttl:               ttl,
-			shouldCacheReq:    shouldCacheReq,
-			logger:            logger,
-			cacheAttempted:    cacheAttempted,
-			cacheHits:         cacheHits,
-			cacheStoreSkipped: cacheStoreSkipped,
+			next:                next,
+			cache:               cache,
+			limits:              limits,
+			ttl:                 ttl,
+			shouldCacheReq:      shouldCacheReq,
+			logger:              logger,
+			cacheLoadAttempted:  cacheLoadAttempted,
+			cacheLoadHits:       cacheLoadHits,
+			cacheStoreAttempted: cacheStoreAttempted,
+			cacheStoreSkipped:   cacheStoreSkipped,
 		}
 	})
 }
@@ -65,11 +66,10 @@ type errorCachingHandler struct {
 	shouldCacheReq shouldCacheFn
 	logger         log.Logger
 
-	cacheAttempted    prometheus.Counter
-	cacheHits         prometheus.Counter
-	cacheStoreSkipped *prometheus.CounterVec
-
-	// TODO: Cache store attempted metric? skipped vs stored?
+	cacheLoadAttempted  prometheus.Counter
+	cacheLoadHits       prometheus.Counter
+	cacheStoreAttempted prometheus.Counter
+	cacheStoreSkipped   *prometheus.CounterVec
 }
 
 func (e *errorCachingHandler) Do(ctx context.Context, request MetricsQueryRequest) (Response, error) {
@@ -81,16 +81,15 @@ func (e *errorCachingHandler) Do(ctx context.Context, request MetricsQueryReques
 
 	// Check if caching has disabled via an option on the request
 	if !e.shouldCacheReq(request) {
-		e.cacheStoreSkipped.WithLabelValues(reasonDisabledByOption).Inc()
 		return e.next.Do(ctx, request)
 	}
 
-	e.cacheAttempted.Inc()
+	e.cacheLoadAttempted.Inc()
 	key := e.cacheKey(tenant.JoinTenantIDs(tenantIDs), request)
 	hashedKey := cacheHashKey(key)
 
 	if cachedErr := e.loadErrorFromCache(ctx, key, hashedKey); cachedErr != nil {
-		e.cacheHits.Inc()
+		e.cacheLoadHits.Inc()
 		spanLog.DebugLog(
 			"msg", "returned cached API error",
 			"error_type", cachedErr.Type,
@@ -103,13 +102,15 @@ func (e *errorCachingHandler) Do(ctx context.Context, request MetricsQueryReques
 
 	res, err := e.next.Do(ctx, request)
 	if err != nil {
+		e.cacheStoreAttempted.Inc()
+
 		var apiErr *apierror.APIError
 		if !errors.As(err, &apiErr) {
 			e.cacheStoreSkipped.WithLabelValues(reasonNotAPIError).Inc()
 			return res, err
 		}
 
-		if cacheable, reason := e.isCacheable(apiErr, request, tenantIDs); !cacheable {
+		if cacheable, reason := e.isCacheable(apiErr); !cacheable {
 			e.cacheStoreSkipped.WithLabelValues(reason).Inc()
 			spanLog.DebugLog(
 				"msg", "error result from request is not cacheable",
@@ -169,14 +170,10 @@ func (e *errorCachingHandler) cacheKey(tenantID string, r MetricsQueryRequest) s
 	return fmt.Sprintf("EC:%s:%s:%d:%d:%d", tenantID, r.GetQuery(), r.GetStart(), r.GetEnd(), r.GetStep())
 }
 
-func (e *errorCachingHandler) isCacheable(apiErr *apierror.APIError, req MetricsQueryRequest, tenantIDs []string) (bool, string) {
+func (e *errorCachingHandler) isCacheable(apiErr *apierror.APIError) (bool, string) {
 	if apiErr.Type != apierror.TypeBadData && apiErr.Type != apierror.TypeExec && apiErr.Type != apierror.TypeTooLargeEntry {
 		return false, reasonNotCacheableError
 	}
 
-	maxCacheFreshness := validation.MaxDurationPerTenant(tenantIDs, e.limits.MaxCacheFreshness)
-	maxCacheTime := int64(model.Now().Add(-maxCacheFreshness))
-	cacheUnalignedRequests := validation.AllTrueBooleansPerTenant(tenantIDs, e.limits.ResultsCacheForUnalignedQueryEnabled)
-
-	return isRequestCachable(req, maxCacheTime, cacheUnalignedRequests, e.logger)
+	return true, ""
 }
