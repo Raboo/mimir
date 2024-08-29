@@ -62,6 +62,10 @@ type QuerierWorkerQueuePriorityAlgo struct {
 	nodesChecked          int
 }
 
+func (qa *QuerierWorkerQueuePriorityAlgo) setup(dequeueReq *QuerierWorkerDequeueRequest) {
+	qa.currentQuerierWorker = dequeueReq.WorkerID
+}
+
 func NewQuerierWorkerQueuePriorityAlgo() *QuerierWorkerQueuePriorityAlgo {
 	return &QuerierWorkerQueuePriorityAlgo{
 		nodeCounts: make(map[string]int),

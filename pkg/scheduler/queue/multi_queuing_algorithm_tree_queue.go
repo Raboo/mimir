@@ -15,7 +15,7 @@ const localQueueIndex = -1
 type Tree interface {
 	EnqueueFrontByPath(QueuePath, any) error
 	EnqueueBackByPath(QueuePath, any) error
-	Dequeue() (QueuePath, any)
+	Dequeue(dequeueReq *QuerierWorkerDequeueRequest) (QueuePath, any)
 	ItemCount() int
 	IsEmpty() bool
 }
@@ -71,7 +71,10 @@ func (t *MultiQueuingAlgorithmTreeQueue) IsEmpty() bool {
 // Nodes that empty down to the leaf after being dequeued from (or which are found to be empty leaf
 // nodes during the dequeue operation) are deleted as the recursion returns up the stack. This
 // maintains structural guarantees relied upon to make IsEmpty() non-recursive.
-func (t *MultiQueuingAlgorithmTreeQueue) Dequeue() (QueuePath, any) {
+func (t *MultiQueuingAlgorithmTreeQueue) Dequeue(dequeueReq *QuerierWorkerDequeueRequest) (QueuePath, any) {
+	for _, qa := range t.algosByDepth {
+		qa.setup(dequeueReq)
+	}
 	path, v := t.rootNode.dequeue()
 	// The returned node dequeue path includes the root node; exclude
 	// this so that the return path can be used if needed to enqueue.

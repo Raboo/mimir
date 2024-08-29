@@ -434,6 +434,24 @@ func (tqa *tenantQuerierAssignments) shuffleTenantQueriers(tenantID TenantID, sc
 	return true
 }
 
+type tenantQuerierAssignmentDequeueArgs struct {
+	querierID        QuerierID
+	tenantOrderIndex int
+}
+
+func (tqa *tenantQuerierAssignments) setup(dequeueReq *QuerierWorkerDequeueRequest) {
+	tqa.currentQuerier = dequeueReq.QuerierID
+	tqa.tenantOrderIndex = dequeueReq.lastTenantIndex.last
+}
+
+// updateQueuingAlgorithmState should be called before attempting to dequeue, and updates inputs required by this
+// QueuingAlgorithm to dequeue the appropriate value for the given querier. In some test cases, it need not be called
+// before consecutive dequeues for the same querier, but in all operating cases, it should be called ahead of a dequeue.
+func (tqa *tenantQuerierAssignments) updateQueuingAlgorithmState(querierID QuerierID, tenantOrderIndex int) {
+	tqa.currentQuerier = querierID
+	tqa.tenantOrderIndex = tenantOrderIndex
+}
+
 // dequeueSelectNode chooses the next node to dequeue from based on tenantIDOrder and tenantOrderIndex, which are
 // shared across all nodes to maintain an O(n) (where n = # tenants) time-to-dequeue for each tenant.
 // If tenant order were maintained by individual nodes, we would end up with O(mn) (where m = # query components)
@@ -586,12 +604,4 @@ func (tqa *tenantQuerierAssignments) addChildNode(parent, child *Node) {
 	}
 	// if we get here, we didn't find any empty elements in tenantIDOrder; append
 	tqa.tenantIDOrder = append(tqa.tenantIDOrder, TenantID(childName))
-}
-
-// updateQueuingAlgorithmState should be called before attempting to dequeue, and updates inputs required by this
-// QueuingAlgorithm to dequeue the appropriate value for the given querier. In some test cases, it need not be called
-// before consecutive dequeues for the same querier, but in all operating cases, it should be called ahead of a dequeue.
-func (tqa *tenantQuerierAssignments) updateQueuingAlgorithmState(querierID QuerierID, tenantOrderIndex int) {
-	tqa.currentQuerier = querierID
-	tqa.tenantOrderIndex = tenantOrderIndex
 }
