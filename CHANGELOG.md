@@ -97,7 +97,7 @@
 * [BUGFIX] Querier: fix issue where some native histogram-related warnings were not emitted when `rate()` was used over native histograms. #8918
 * [BUGFIX] Ruler: map invalid org-id errors to 400 status code. #8935
 * [BUGFIX] Querier: Fix invalid query results when multiple chunks are being merged. #8992
-* [BUGFIX] Querier: Support optional start and end times on `/prometheus/api/v1/labels`, `/prometheus/api/v1/label/\<label\>/values`, and `/prometheus/api/v1/series` when `max_query_into_future: 0`. #9129
+* [BUGFIX] Querier: Support optional start and end times on `/prometheus/api/v1/labels`, `/prometheus/api/v1/label/<label>/values`, and `/prometheus/api/v1/series` when `max_query_into_future: 0`. #9129
 
 ### Mixin
 
